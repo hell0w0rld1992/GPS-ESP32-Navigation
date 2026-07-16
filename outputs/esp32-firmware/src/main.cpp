@@ -1,503 +1,266 @@
 /*
- * BikeGPS ESP32-S3 固件
- * 硬件: ESP32-S3 N16R8 + GC9A01 1.28寸圆形屏 (240x240)
- * 协议: 与 bikegps Android/iOS 端兼容 (BLE NUS)
+ * BikeGPS ESP32-S3 Firmware
+ * Hardware: ESP32-S3 N16R8 + GC9A01 1.28" Round (240x240)
+ * Display: Arduino_GFX (tested & working on this hardware)
+ * Protocol: BLE NUS (compatible with BikeGPS Android app)
  *
- * 引脚:
- *   GC9A01: VCC-3.3V GND-GND RST-GPIO8 CS-GPIO10 DC-GPIO9 SDA-GPIO11 SCL-GPIO12
- *   (无 BLK 引脚)
+ * Pins: VCC-3.3V GND-GND RST-8 CS-10 DC-9 SDA-11 SCL-12 (no BLK)
  */
 
 #include <Arduino.h>
+#include <Arduino_GFX_Library.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
-#include <TFT_eSPI.h>
 #include <esp_task_wdt.h>
 
 // ============================================================
-// BLE — Nordic UART Service (兼容 bikegps)
+// Display — Arduino_GC9A01 (使用 FSPI, 与 fluxdown 一致)
+// ============================================================
+static constexpr int PIN_SCK  = 12;
+static constexpr int PIN_MOSI = 11;
+static constexpr int PIN_DC   = 9;
+static constexpr int PIN_CS   = 10;
+static constexpr int PIN_RST  = 8;
+
+Arduino_DataBus *bus = new Arduino_ESP32SPI(
+    PIN_DC, PIN_CS, PIN_SCK, PIN_MOSI, GFX_NOT_DEFINED, FSPI);
+Arduino_GFX *gfx = new Arduino_GC9A01(bus, PIN_RST, 0 /* rotation */, true /* IPS */);
+
+#define CENTER_X 120
+#define CENTER_Y 115
+
+// ============================================================
+// BLE — Nordic UART Service (NUS)
 // ============================================================
 #define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-#define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  // 手机→ESP
-#define NUS_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  // ESP→手机
+#define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 BLEServer       *pServer     = nullptr;
 BLEService      *pService    = nullptr;
-BLECharacteristic *pTxChar   = nullptr;  // ESP→手机 (notify)
-BLECharacteristic *pRxChar   = nullptr;  // 手机→ESP (write)
+BLECharacteristic *pTxChar   = nullptr;
+BLECharacteristic *pRxChar   = nullptr;
 bool            bleConnected = false;
 
-// PKT 分片重组
+// ============================================================
+// PKT fragment reassembly
+// ============================================================
 #define PKT_BUF_SIZE 1024
 char pktBuffer[PKT_BUF_SIZE];
-int  pktOffset = 0;
-int  pktTotal  = 0;
-int  pktReceived = 0;
+int  pktOffset = 0, pktTotal = 0, pktReceived = 0;
 bool pktActive = false;
 
 // ============================================================
-// TFT — GC9A01 圆形屏
-// ============================================================
-TFT_eSPI tft = TFT_eSPI();
-#define CENTER_X 120
-#define CENTER_Y 120
-#define SCREEN_R 119
-
-// ============================================================
-// 导航状态 (从 JSON 解析)
+// Navigation state (parsed from JSON)
 // ============================================================
 struct NavState {
   double  lat = 0, lon = 0;
-  float   speed = 0;
-  float   heading = 0;
-  int     nav = -1;       // -1=off 0=straight 1=right 2=left 3=uturn 4=arrived
-  int     ndist = 0;      // 距离下一步 (米)
-  char    nst[32] = "";   // 下条路名
-  char    timeStr[8] = ""; // HH:MM
-  float   alt = 0;
-  float   bat = -1;
-  float   wtmp = 0;
+  float   speed = 0, heading = 0;
+  int     nav = -1, ndist = 0;
+  char    nst[32] = "", timeStr[8] = "";
+  float   alt = 0, bat = -1, wtmp = 0;
   int     wrain = 0;
 };
 NavState navState;
 bool     navUpdated = false;
 
 // ============================================================
-// 简易 JSON 解析 (不依赖 External library)
+// Simple JSON parser
 // ============================================================
 void parseJson(const char *json) {
-  NavState s;
-  s.nav = -1;
-
-  // 逐字段查找
+  NavState s; s.nav = -1;
   const char *p;
-
-  if ((p = strstr(json, "\"lat\":")))  s.lat = atof(p + 6);
-  if ((p = strstr(json, "\"lon\":")))  s.lon = atof(p + 6);
-  if ((p = strstr(json, "\"speed\":"))) s.speed = atof(p + 7);
+  if ((p = strstr(json, "\"lat\":")))     s.lat     = atof(p + 6);
+  if ((p = strstr(json, "\"lon\":")))     s.lon     = atof(p + 6);
+  if ((p = strstr(json, "\"speed\":")))   s.speed   = atof(p + 7);
   if ((p = strstr(json, "\"heading\":"))) s.heading = atof(p + 9);
-  if ((p = strstr(json, "\"alt\":")))  s.alt = atof(p + 6);
-  if ((p = strstr(json, "\"nav\":")))  s.nav = atoi(p + 6);
-  if ((p = strstr(json, "\"ndist\":"))) s.ndist = atoi(p + 7);
-  if ((p = strstr(json, "\"bat\":")))  s.bat = atof(p + 5);
-  if ((p = strstr(json, "\"wtmp\":"))) s.wtmp = atof(p + 6);
-  if ((p = strstr(json, "\"wrain\":"))) s.wrain = atoi(p + 7);
+  if ((p = strstr(json, "\"alt\":")))     s.alt     = atof(p + 6);
+  if ((p = strstr(json, "\"nav\":")))     s.nav     = atoi(p + 6);
+  if ((p = strstr(json, "\"ndist\":")))   s.ndist   = atoi(p + 7);
+  if ((p = strstr(json, "\"bat\":")))     s.bat     = atof(p + 5);
+  if ((p = strstr(json, "\"wtmp\":")))    s.wtmp    = atof(p + 6);
+  if ((p = strstr(json, "\"wrain\":")))   s.wrain   = atoi(p + 7);
 
-  // time: "HH:MM"
   if ((p = strstr(json, "\"time\":"))) {
-    const char *q = strchr(p + 7, '"');  // skip past opening quote
-    if (q) {
-      int len = 0;
-      const char *start = q;
-      q++; // skip opening "
-      while (*q && *q != '"' && len < 7) { s.timeStr[len++] = *q; q++; }
-      s.timeStr[len] = '\0';
-    }
+    const char *q = strchr(p + 7, '"');
+    if (q) { int n = 0; for (q++; *q && *q != '"' && n < 7; ++n) s.timeStr[n] = *q++; s.timeStr[n] = 0; }
   }
-
-  // nst: street name
   if ((p = strstr(json, "\"nst\":"))) {
     const char *q = strchr(p + 6, '"');
-    if (q) {
-      q++;  // skip opening "
-      int len = 0;
-      while (*q && *q != '"' && len < 31) { s.nst[len++] = *q; q++; }
-      s.nst[len] = '\0';
-    }
+    if (q) { int n = 0; for (q++; *q && *q != '"' && n < 31; ++n) s.nst[n] = *q++; s.nst[n] = 0; }
   }
-
-  // 只在有 nav 字段时才更新（防止空包刷新屏幕）
-  if (strstr(json, "\"nav\":")) {
-    navState = s;
-    navUpdated = true;
-  }
+  if (strstr(json, "\"nav\":")) { navState = s; navUpdated = true; }
 }
 
 // ============================================================
-// BLE Callbacks
+// BLE callbacks
 // ============================================================
-class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* s) override {
-    bleConnected = true;
-    Serial.println("[BLE] 已连接");
-  }
-  void onDisconnect(BLEServer* s) override {
-    bleConnected = false;
-    Serial.println("[BLE] 已断开，重新广播");
-    pServer->startAdvertising();
-  }
+class ServerCB : public BLEServerCallbacks {
+  void onConnect(BLEServer* s) override { bleConnected = true; Serial.println("[BLE] connected"); }
+  void onDisconnect(BLEServer* s) override { bleConnected = false; pServer->startAdvertising(); Serial.println("[BLE] disconnected"); }
 };
 
 void handlePktData(const char *data, size_t len) {
-  // 检查 PKT:NNN/NNN: 前缀
   if (strncmp(data, "PKT:", 4) == 0) {
-    int fragIdx = 0, total = 0;
-    if (sscanf(data, "PKT:%d/%d:", &fragIdx, &total) == 2) {
-      const char *payload = strchr(data + 4, ':');
-      if (!payload) return;
-      payload++;  // skip ':'
-      size_t payloadLen = len - (payload - data);
-
-      if (fragIdx == 1) {
-        pktOffset = 0;
-        pktTotal  = total;
-        pktReceived = 1;
-        pktActive = true;
-      }
-
-      if (pktActive && fragIdx == pktReceived + 1) {
-        memcpy(pktBuffer + pktOffset, payload, payloadLen);
-        pktOffset += payloadLen;
-        pktReceived++;
-
-        if (pktReceived >= pktTotal) {
-          pktBuffer[pktOffset] = '\0';
-          parseJson(pktBuffer);
-          pktActive = false;
-        }
-      } else {
-        pktActive = false;  // 乱序，放弃
-      }
+    int fi = 0, total = 0;
+    if (sscanf(data, "PKT:%d/%d:", &fi, &total) == 2) {
+      const char *payload = strchr(data + 4, ':'); if (!payload) return; payload++;
+      size_t plen = len - (payload - data);
+      if (fi == 1) { pktOffset = 0; pktTotal = total; pktReceived = 1; pktActive = true; }
+      if (pktActive && fi == pktReceived + 1) {
+        memcpy(pktBuffer + pktOffset, payload, plen); pktOffset += plen; pktReceived++;
+        if (pktReceived >= pktTotal) { pktBuffer[pktOffset] = 0; parseJson(pktBuffer); pktActive = false; }
+      } else pktActive = false;
     }
   } else {
-    // 无分片，直接解析
-    char buf[512];
-    size_t copyLen = (len < 511) ? len : 511;
-    memcpy(buf, data, copyLen);
-    buf[copyLen] = '\0';
+    char buf[512]; size_t n = (len < 511) ? len : 511;
+    memcpy(buf, data, n); buf[n] = 0;
     parseJson(buf);
   }
 }
 
-class RxCallback : public BLECharacteristicCallbacks {
+class RxCB : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *c) override {
-    std::string rxValue = c->getValue();
-    if (rxValue.length() > 0) {
-      handlePktData(rxValue.data(), rxValue.length());
-    }
+    std::string v = c->getValue();
+    if (v.length() > 0) handlePktData(v.data(), v.length());
   }
 };
 
-// ============================================================
-// BLE 初始化
-// ============================================================
 void initBLE() {
-  Serial.println("[BLE] 初始化开始...");
   BLEDevice::init("BikeGPS");
-
-  pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new ServerCallbacks());
-
+  pServer = BLEDevice::createServer(); pServer->setCallbacks(new ServerCB());
   pService = pServer->createService(BLEUUID(NUS_SERVICE_UUID));
-
-  pTxChar = pService->createCharacteristic(
-    BLEUUID(NUS_TX_UUID),
-    BLECharacteristic::PROPERTY_NOTIFY
-  );
-
-  pRxChar = pService->createCharacteristic(
-    BLEUUID(NUS_RX_UUID),
-    BLECharacteristic::PROPERTY_WRITE_NR
-  );
-  pRxChar->setCallbacks(new RxCallback());
-
+  pTxChar = pService->createCharacteristic(BLEUUID(NUS_TX_UUID), BLECharacteristic::PROPERTY_NOTIFY);
+  pRxChar = pService->createCharacteristic(BLEUUID(NUS_RX_UUID), BLECharacteristic::PROPERTY_WRITE_NR);
+  pRxChar->setCallbacks(new RxCB());
   pService->start();
-
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(BLEUUID(NUS_SERVICE_UUID));
-  pAdvertising->setScanResponse(true);
-  pAdvertising->setMinPreferred(0x06);
-  pAdvertising->setMaxPreferred(0x12);
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(BLEUUID(NUS_SERVICE_UUID));
+  adv->setScanResponse(true);
   BLEDevice::startAdvertising();
-
-  Serial.println("[BLE] 已广播");
-  delay(100);  // BLE stabilization delay
-  Serial.println("[系统] 启动完成");
-  Serial.printf("[Heap] 可用: %d\n", ESP.getFreeHeap());
+  Serial.println("[BLE] broadcasting as BikeGPS");
 }
 
 // ============================================================
-// 显示绘制
+// Display drawing (Arduino_GFX API)
 // ============================================================
-void drawNavArrow(int cx, int cy, int maneuver, uint16_t color) {
-  int s = 30;  // arrow half-size
-
-  tft.setTextColor(color, TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextSize(1);
-
+void drawArrow(int cx, int cy, int maneuver, uint16_t color) {
+  int s = 20;
   switch (maneuver) {
-    case -1: // off — 显示 "—"
-      tft.setTextFont(4);
-      tft.drawString("--", cx, cy);
+    case -1: gfx->setTextSize(3); gfx->setCursor(cx - 12, cy - 10); gfx->print("--"); break;
+    case 0:
+      gfx->fillTriangle(cx, cy - s, cx - s, cy + s, cx + s, cy + s, color);
+      gfx->fillRect(cx - s/3, cy, 2*s/3, s * 2/3, color);
       break;
-
-    case 0: // 直行 — 箭头向上
-      tft.fillTriangle(cx, cy-s, cx-s, cy+s, cx+s, cy+s, color);
-      tft.fillRect(cx-s/3, cy+s/2, 2*s/3, s/2, color);
+    case 1: case 3:
+      gfx->fillTriangle(cx + s, cy, cx - s, cy - s, cx - s, cy + s, color);
       break;
-
-    case 1: // 右转 — 箭头向右
-      tft.fillTriangle(cx+s, cy, cx-s, cy-s, cx-s, cy+s, color);
-      tft.fillRect(cx-s, cy-s/3, s, 2*s/3, color);
+    case 2:
+      gfx->fillTriangle(cx - s, cy, cx + s, cy - s, cx + s, cy + s, color);
       break;
-
-    case 2: // 左转 — 箭头向左
-      tft.fillTriangle(cx-s, cy, cx+s, cy-s, cx+s, cy+s, color);
-      tft.fillRect(cx-s/2, cy-s/3, s, 2*s/3, color);
-      break;
-
-    case 3: { // 掉头 — U 形箭头 (向下 + 圆弧)
-      // 向下箭头
-      tft.fillTriangle(cx, cy+s, cx-s, cy-s, cx+s, cy-s, color);
-      tft.fillRect(cx-s/3, cy-s, 2*s/3, s, color);
-      // 圆弧
-      tft.drawCircle(cx, cy-s/2, s*2/3, color);
-      break;
-    }
-
-    case 4: // 到达 — 对勾
-      tft.setTextFont(4);
-      tft.drawString("OK", cx, cy);
-      tft.setTextFont(2);
-      tft.drawString("到达", cx, cy + 20);
-      break;
+    case 4:
+      gfx->setTextSize(3); gfx->setCursor(cx - 12, cy - 10); gfx->print("OK"); break;
   }
 }
 
 void drawSpeed(int cx, int cy, float speed) {
   char buf[16];
-  if (speed >= 100)   snprintf(buf, sizeof(buf), "%.0f", speed);
+  if (speed >= 100) snprintf(buf, sizeof(buf), "%.0f", speed);
   else if (speed >= 10) snprintf(buf, sizeof(buf), "%.0f", speed);
-  else                  snprintf(buf, sizeof(buf), "%.1f", speed);
-
-  tft.setTextColor(TFT_SILVER, TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextFont(6);
-  tft.drawString(buf, cx, cy - 35);
-
-  tft.setTextFont(2);
-  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.drawString("km/h", cx, cy - 18);
+  else snprintf(buf, sizeof(buf), "%.1f", speed);
+  gfx->setTextColor(RGB565_WHITE);
+  gfx->setTextSize(4);
+  gfx->setCursor(cx - 30, cy - 40);
+  gfx->print(buf);
 }
 
 void drawDistance(int cx, int cy, int meters) {
-  char buf[32];
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextFont(4);
-
-  if (meters >= 1000) {
-    snprintf(buf, sizeof(buf), "%.1fkm", meters / 1000.0);
-  } else {
-    snprintf(buf, sizeof(buf), "%dm", meters);
-  }
-  tft.drawString(buf, cx, cy + 42);
+  char buf[16];
+  gfx->setTextColor(RGB565_CYAN);
+  gfx->setTextSize(3);
+  if (meters >= 1000) snprintf(buf, sizeof(buf), "%.1fkm", meters / 1000.0);
+  else snprintf(buf, sizeof(buf), "%dm", meters);
+  gfx->setCursor(cx - 24, cy + 30);
+  gfx->print(buf);
 }
 
-void drawStreetName(int cx, int cy, const char *name) {
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextFont(2);
-  tft.drawString(name, cx, cy + 62);
+void drawStatusBar(float bat, const char *timeStr) {
+  gfx->setTextColor(RGB565_DARKGREY);
+  gfx->setTextSize(1);
+  gfx->setCursor(8, 8);
+  if (bat >= 0) { gfx->printf("%.0f%%", bat * 100); gfx->setCursor(55, 8); }
+  gfx->print(timeStr);
+  // BLE dot
+  gfx->fillCircle(230, 10, 4, bleConnected ? RGB565_GREEN : RGB565_RED);
 }
 
-void drawConnectionStatus() {
-  // 右上角小圆点
-  int x = 220, y = 10, r = 4;
-  if (bleConnected) {
-    tft.fillCircle(x, y, r, TFT_GREEN);
-  } else {
-    tft.fillCircle(x, y, r, TFT_RED);
-  }
-}
-
-void drawBattery(float bat) {
-  if (bat < 0) return;
-  int x = 10, y = 10;
-  tft.drawRect(x, y, 20, 8, TFT_WHITE);
-  tft.fillRect(x + 20, y + 2, 3, 4, TFT_WHITE);
-  int fillW = (int)(18 * bat);
-  if (fillW > 18) fillW = 18;
-  if (fillW < 0) fillW = 0;
-  uint16_t batColor = (bat > 0.3) ? TFT_GREEN : TFT_RED;
-  tft.fillRect(x + 1, y + 1, fillW, 6, batColor);
-}
-
-void drawTime(const char *timeStr) {
-  if (strlen(timeStr) == 0) return;
-  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextFont(1);
-  tft.drawString(timeStr, CENTER_X, SCREEN_R + 4);
-}
-
-void drawWeather(float temp, int rain) {
-  if (temp == 0 && rain == 0) return;
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%.0fC %d%%", temp, rain);
-  tft.setTextColor(TFT_OLIVE, TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextFont(1);
-  tft.drawString(buf, CENTER_X, 228);
-}
-
-// ============================================================
-// 全屏刷新
-// ============================================================
 void redrawDisplay() {
-  // 清屏 (用黑圈限制在圆形区域内)
-  tft.fillScreen(TFT_BLACK);
-  // 画圆形边框
-  tft.drawCircle(CENTER_X, CENTER_Y, SCREEN_R, TFT_DARKGREY);
+  gfx->fillScreen(RGB565_BLACK);
 
-  // 速度
+  drawStatusBar(navState.bat, navState.timeStr);
   drawSpeed(CENTER_X, CENTER_Y, navState.speed);
 
-  // 导航箭头
-  uint16_t arrowColor = TFT_WHITE;
-  if (navState.nav == 4) arrowColor = TFT_GREEN;  // 到达
-  drawNavArrow(CENTER_X, CENTER_Y, navState.nav, arrowColor);
+  uint16_t arrowColor = (navState.nav == 4) ? RGB565_GREEN : RGB565_WHITE;
+  drawArrow(CENTER_X, CENTER_Y + 5, navState.nav, arrowColor);
 
-  // 距离
-  if (navState.nav >= 0 && navState.nav != 4) {
+  if (navState.nav >= 0 && navState.nav != 4)
     drawDistance(CENTER_X, CENTER_Y, navState.ndist);
-  }
 
-  // 路名
   if (strlen(navState.nst) > 0) {
-    drawStreetName(CENTER_X, CENTER_Y, navState.nst);
+    gfx->setTextColor(RGB565_YELLOW);
+    gfx->setTextSize(1);
+    gfx->setCursor(30, 215);
+    gfx->print(navState.nst);
   }
-
-  // 连接状态
-  drawConnectionStatus();
-  drawBattery(navState.bat);
-  drawTime(navState.timeStr);
-  drawWeather(navState.wtmp, navState.wrain);
 }
 
-// ============================================================
-// 启动画面
-// ============================================================
 void showSplash() {
-  Serial.println("[TFT] 显示启动画面...");
+  // Color test
+  gfx->fillScreen(RGB565_RED);    delay(200);
+  gfx->fillScreen(RGB565_GREEN);  delay(200);
+  gfx->fillScreen(RGB565_BLUE);   delay(200);
+  gfx->fillScreen(RGB565_BLACK);
 
-  // 全屏填充不同颜色测试屏幕是否工作
-  tft.fillScreen(TFT_RED);
-  delay(300);
-  tft.fillScreen(TFT_GREEN);
-  delay(300);
-  tft.fillScreen(TFT_BLUE);
-  delay(300);
-  tft.fillScreen(TFT_BLACK);
-
-  // 画圆形边框
-  tft.drawCircle(CENTER_X, CENTER_Y, SCREEN_R, TFT_DARKGREY);
-
-  // 画测试方块
-  tft.fillRect(50, 50, 20, 20, TFT_WHITE);
-  tft.fillRect(CENTER_X-10, CENTER_Y-10, 20, 20, TFT_YELLOW);
-
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextFont(4);
-  tft.drawString("BikeGPS", CENTER_X, CENTER_Y - 20);
-  tft.setTextFont(2);
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.drawString("等待连接...", CENTER_X, CENTER_Y + 20);
-  // Try different rotations - fill screen with color to test
-  tft.setRotation(0);
-  tft.fillScreen(TFT_RED);
-  delay(200);
-  tft.fillScreen(TFT_GREEN);
-  delay(200);
-  tft.fillScreen(TFT_BLUE);
-  delay(200);
-  tft.fillScreen(TFT_WHITE);
-  delay(200);
-  tft.fillScreen(TFT_BLACK);
-
-  // Now draw the splash screen
-  tft.drawCircle(CENTER_X, CENTER_Y, SCREEN_R, TFT_DARKGREY);
-  tft.fillRect(50, 50, 20, 20, TFT_WHITE);
-  tft.fillRect(CENTER_X-10, CENTER_Y-10, 20, 20, TFT_YELLOW);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextFont(4);
-  tft.drawString("BikeGPS", CENTER_X, CENTER_Y - 20);
-  tft.setTextFont(2);
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.drawString("等待连接...", CENTER_X, CENTER_Y + 20);
-  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.setTextFont(1);
-  tft.drawString("ESP32-S3 + GC9A01", CENTER_X, CENTER_Y + 45);
-
-  Serial.println("[TFT] 启动画面完成");
+  gfx->setTextColor(RGB565_WHITE);
+  gfx->setTextSize(3);
+  gfx->setCursor(50, CENTER_Y - 20);
+  gfx->print("BikeGPS");
+  gfx->setTextSize(1);
+  gfx->setCursor(55, CENTER_Y + 15);
+  gfx->print("ESP32-S3 + GC9A01");
+  gfx->setTextColor(RGB565_CYAN);
+  gfx->setCursor(65, CENTER_Y + 30);
+  gfx->print("waiting...");
 }
 
 // ============================================================
-// 主循环
+// Setup & Loop
 // ============================================================
 void setup() {
   Serial.begin(115200);
-  delay(2000);
-  Serial.println("\n\n=== BikeGPS ESP32-S3 Firmware ===");
-  esp_task_wdt_init(15, true);  // 15s watchdog, panic on timeout
-  Serial.println("[TEST] GPIO pin test starting...");
+  delay(1500);
+  Serial.println("\n=== BikeGPS ESP32-S3 ===");
+  esp_task_wdt_init(15, true);
 
-  // Test each display pin by setting HIGH for 1s
-  int testPins[] = {8, 9, 10, 11, 12};
-  const char* pinNames[] = {"RST(8)", "DC(9)", "CS(10)", "SDA(11)", "SCL(12)"};
-  for (int i = 0; i < 5; i++) {
-    pinMode(testPins[i], OUTPUT);
-    digitalWrite(testPins[i], HIGH);
-    Serial.printf("[TEST] %s = HIGH\n", pinNames[i]);
-    delay(300);
-    digitalWrite(testPins[i], LOW);
-  }
-  Serial.println("[TEST] Pin test done. If display has backlight, check if it flickered.");
-
-
-  // 检查 PSRAM
-  if (psramFound()) {
-    Serial.printf("[PSRAM] 已检测: %d bytes 可用, %d bytes 总计\n",
-                  ESP.getFreePsram(), ESP.getPsramSize());
-  } else {
-    Serial.println("[PSRAM] 未检测到 PSRAM!");
-  }
-  Serial.printf("[Heap] 可用: %d bytes\n", ESP.getFreeHeap());
-
-  // 初始化屏幕
-  Serial.println("[TFT] 初始化屏幕...");
-  tft.init();
-  tft.setRotation(0);
-  tft.fillScreen(TFT_BLACK);
+  // Init display (same as fluxdown)
+  gfx->begin();
+  gfx->fillScreen(RGB565_BLACK);
   showSplash();
+  Serial.println("[TFT] init OK");
 
-  // 初始化 BLE
+  // BLE
   initBLE();
-
-  Serial.println("[系统] 启动完成");
-  Serial.printf("[Heap] 启动后可用: %d bytes\n", ESP.getFreeHeap());
+  Serial.println("[SYS] ready");
 }
 
 void loop() {
-  esp_task_wdt_reset();  // feed the watchdog
-  static unsigned long lastRefresh = 0;
+  esp_task_wdt_reset();
+  static bool lastBle = false;
 
-  if (navUpdated) {
-    navUpdated = false;
-    redrawDisplay();
-    lastRefresh = millis();
-  }
+  if (navUpdated) { navUpdated = false; redrawDisplay(); }
 
-  // 连接状态变化时也刷新
-  static bool lastBleState = false;
-  if (bleConnected != lastBleState) {
-    lastBleState = bleConnected;
-    redrawDisplay();
-  }
+  if (bleConnected != lastBle) { lastBle = bleConnected; redrawDisplay(); }
 
-  delay(50);  // 20 FPS, feeds watchdog
+  delay(50);
 }
