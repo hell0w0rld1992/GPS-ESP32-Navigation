@@ -182,7 +182,9 @@ class RxCallback : public BLECharacteristicCallbacks {
 // BLE 初始化
 // ============================================================
 void initBLE() {
+  Serial.println("[BLE] 初始化开始...");
   BLEDevice::init("BikeGPS");
+
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
 
@@ -192,6 +194,7 @@ void initBLE() {
     BLEUUID(NUS_TX_UUID),
     BLECharacteristic::PROPERTY_NOTIFY
   );
+  pTxChar->addDescriptor(new BLE2902());
 
   pRxChar = pService->createCharacteristic(
     BLEUUID(NUS_RX_UUID),
@@ -208,7 +211,11 @@ void initBLE() {
   pAdvertising->setMaxPreferred(0x12);
   BLEDevice::startAdvertising();
 
-  Serial.println("[BLE] 已启动，设备名: BikeGPS");
+  Serial.println("[BLE] 已广播，设备名: BikeGPS");
+  Serial.print("[BLE] TX UUID: ");
+  Serial.println(NUS_TX_UUID);
+  Serial.print("[BLE] RX UUID: ");
+  Serial.println(NUS_RX_UUID);
 }
 
 // ============================================================
@@ -375,8 +382,24 @@ void redrawDisplay() {
 // 启动画面
 // ============================================================
 void showSplash() {
+  Serial.println("[TFT] 显示启动画面...");
+
+  // 全屏填充不同颜色测试屏幕是否工作
+  tft.fillScreen(TFT_RED);
+  delay(300);
+  tft.fillScreen(TFT_GREEN);
+  delay(300);
+  tft.fillScreen(TFT_BLUE);
+  delay(300);
   tft.fillScreen(TFT_BLACK);
+
+  // 画圆形边框
   tft.drawCircle(CENTER_X, CENTER_Y, SCREEN_R, TFT_DARKGREY);
+
+  // 画测试方块
+  tft.fillRect(50, 50, 20, 20, TFT_WHITE);
+  tft.fillRect(CENTER_X-10, CENTER_Y-10, 20, 20, TFT_YELLOW);
+
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextDatum(MC_DATUM);
   tft.setTextFont(4);
@@ -387,6 +410,8 @@ void showSplash() {
   tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
   tft.setTextFont(1);
   tft.drawString("ESP32-S3 + GC9A01", CENTER_X, CENTER_Y + 45);
+
+  Serial.println("[TFT] 启动画面完成");
 }
 
 // ============================================================
@@ -397,7 +422,17 @@ void setup() {
   delay(500);
   Serial.println("\n\n=== BikeGPS ESP32-S3 Firmware ===");
 
+  // 检查 PSRAM
+  if (psramFound()) {
+    Serial.printf("[PSRAM] 已检测: %d bytes 可用, %d bytes 总计\n",
+                  ESP.getFreePsram(), ESP.getPsramSize());
+  } else {
+    Serial.println("[PSRAM] 未检测到 PSRAM!");
+  }
+  Serial.printf("[Heap] 可用: %d bytes\n", ESP.getFreeHeap());
+
   // 初始化屏幕
+  Serial.println("[TFT] 初始化屏幕...");
   tft.init();
   tft.setRotation(0);
   tft.fillScreen(TFT_BLACK);
@@ -407,6 +442,7 @@ void setup() {
   initBLE();
 
   Serial.println("[系统] 启动完成");
+  Serial.printf("[Heap] 启动后可用: %d bytes\n", ESP.getFreeHeap());
 }
 
 void loop() {
