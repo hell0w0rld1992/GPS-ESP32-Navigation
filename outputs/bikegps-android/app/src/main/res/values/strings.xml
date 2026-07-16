@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">骑途导航</string>
+    <string name="search_hint">搜索目的地</string>
+    <string name="start_navigation">开始导航</string>
+    <string name="stop_navigation">停止导航</string>
+    <string name="connect_device">连接 ESP32</string>
+    <string name="disconnect">断开连接</string>
+    <string name="scanning">正在扫描…</string>
+    <string name="connecting">正在连接…</string>
+    <string name="connected">已连接</string>
+    <string name="disconnected">已断开</string>
+    <string name="no_device">未找到 BikeGPS 设备</string>
+    <string name="gps_not_available">GPS 不可用</string>
+    <string name="rerouting">正在重新规划路线…</string>
+    <string name="arrived">您已到达目的地</string>
+    <string name="no_route">未找到路线</string>
+    <string name="search_failed">搜索失败</string>
+    <string name="permission_location">需要位置权限以获取导航信息</string>
+    <string name="permission_ble">需要蓝牙权限以连接 ESP32 设备</string>
+    <string name="settings">设置</string>
+    <string name="recent_destinations">最近目的地</string>
+    <string name="my_location">我的位置</string>
+</resources>
