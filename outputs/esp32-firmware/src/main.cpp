@@ -13,6 +13,7 @@
 #include <BLEUtils.h>
 #include <BLEServer.h>
 #include <TFT_eSPI.h>
+#include <esp_task_wdt.h>
 
 // ============================================================
 // BLE — Nordic UART Service (兼容 bikegps)
@@ -405,6 +406,29 @@ void showSplash() {
   tft.setTextFont(2);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
   tft.drawString("等待连接...", CENTER_X, CENTER_Y + 20);
+  // Try different rotations - fill screen with color to test
+  tft.setRotation(0);
+  tft.fillScreen(TFT_RED);
+  delay(200);
+  tft.fillScreen(TFT_GREEN);
+  delay(200);
+  tft.fillScreen(TFT_BLUE);
+  delay(200);
+  tft.fillScreen(TFT_WHITE);
+  delay(200);
+  tft.fillScreen(TFT_BLACK);
+
+  // Now draw the splash screen
+  tft.drawCircle(CENTER_X, CENTER_Y, SCREEN_R, TFT_DARKGREY);
+  tft.fillRect(50, 50, 20, 20, TFT_WHITE);
+  tft.fillRect(CENTER_X-10, CENTER_Y-10, 20, 20, TFT_YELLOW);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(4);
+  tft.drawString("BikeGPS", CENTER_X, CENTER_Y - 20);
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("等待连接...", CENTER_X, CENTER_Y + 20);
   tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
   tft.setTextFont(1);
   tft.drawString("ESP32-S3 + GC9A01", CENTER_X, CENTER_Y + 45);
@@ -417,8 +441,23 @@ void showSplash() {
 // ============================================================
 void setup() {
   Serial.begin(115200);
-  delay(500);
+  delay(2000);
   Serial.println("\n\n=== BikeGPS ESP32-S3 Firmware ===");
+  esp_task_wdt_init(15, true);  // 15s watchdog, panic on timeout
+  Serial.println("[TEST] GPIO pin test starting...");
+
+  // Test each display pin by setting HIGH for 1s
+  int testPins[] = {8, 9, 10, 11, 12};
+  const char* pinNames[] = {"RST(8)", "DC(9)", "CS(10)", "SDA(11)", "SCL(12)"};
+  for (int i = 0; i < 5; i++) {
+    pinMode(testPins[i], OUTPUT);
+    digitalWrite(testPins[i], HIGH);
+    Serial.printf("[TEST] %s = HIGH\n", pinNames[i]);
+    delay(300);
+    digitalWrite(testPins[i], LOW);
+  }
+  Serial.println("[TEST] Pin test done. If display has backlight, check if it flickered.");
+
 
   // 检查 PSRAM
   if (psramFound()) {
@@ -444,6 +483,7 @@ void setup() {
 }
 
 void loop() {
+  esp_task_wdt_reset();  // feed the watchdog
   static unsigned long lastRefresh = 0;
 
   if (navUpdated) {
