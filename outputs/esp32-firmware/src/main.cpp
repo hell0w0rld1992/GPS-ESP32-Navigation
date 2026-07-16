@@ -12,7 +12,6 @@
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
-#include <BLE2902.h>
 #include <TFT_eSPI.h>
 
 // ============================================================
@@ -195,7 +194,6 @@ void initBLE() {
     BLEUUID(NUS_TX_UUID),
     BLECharacteristic::PROPERTY_NOTIFY
   );
-  pTxChar->addDescriptor(new BLE2902());
 
   pRxChar = pService->createCharacteristic(
     BLEUUID(NUS_RX_UUID),
@@ -212,11 +210,10 @@ void initBLE() {
   pAdvertising->setMaxPreferred(0x12);
   BLEDevice::startAdvertising();
 
-  Serial.println("[BLE] 已广播，设备名: BikeGPS");
-  Serial.print("[BLE] TX UUID: ");
-  Serial.println(NUS_TX_UUID);
-  Serial.print("[BLE] RX UUID: ");
-  Serial.println(NUS_RX_UUID);
+  Serial.println("[BLE] 已广播");
+  delay(100);  // BLE stabilization delay
+  Serial.println("[系统] 启动完成");
+  Serial.printf("[Heap] 可用: %d\n", ESP.getFreeHeap());
 }
 
 // ============================================================
@@ -462,5 +459,5 @@ void loop() {
     redrawDisplay();
   }
 
-  delay(50);  // 20 FPS 更新率
+  delay(50);  // 20 FPS, feeds watchdog
 }
